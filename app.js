@@ -1,5 +1,8 @@
 const STORAGE_KEY = "fitlog-state-v2";
 const LEGACY_KEY = "fitlog-state-v1";
+const CLOUD_ROW_ID = "global";
+const CLOUD_TABLE = "fitlog_state";
+const CLOUD_SAVE_DELAY = 900;
 
 function toDateKey(date) {
   const year = date.getFullYear();
@@ -174,6 +177,9 @@ const exercisePoseMap = {
 let state = loadState();
 let chartRange = 14;
 let pendingPhotoEstimate = null;
+let cloudClient = null;
+let cloudSaveTimer = null;
+let isApplyingCloudState = false;
 
 const el = {
   authScreen: document.querySelector("#authScreen"),
@@ -293,6 +299,7 @@ function normalizeState(nextState) {
     name: user.name || `成员${index + 1}`,
     account: user.account || `member${index + 1}`,
     password: user.password || "1234",
+    passwordHash: user.passwordHash || "",
     avatar: user.avatar || "",
     entries: user.entries || {},
     stages: user.stages || []
@@ -308,6 +315,133 @@ function normalizeState(nextState) {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  scheduleCloudSave();
+}
+
+function getCloudClient() {
+  if (cloudClient) return cloudClient;
+  const config = window.FITLOG_SUPABASE || {};
+  if (!config.url || !config.anonKey || !window.supabase?.createClient) return null;
+  cloudClient = window.supabase.createClient(config.url, config.anonKey);
+  return cloudClient;
+}
+
+async function hashPassword(password) {
+  if (!window.crypto?.subtle) return "";
+  const data = new TextEncoder().encode(password);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function passwordMatches(user, password) {
+  if (user.password && user.password === password) return true;
+  if (!user.passwordHash) return false;
+  return user.passwordHash === await hashPassword(password);
+}
+
+function cloudUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    account: user.account,
+    passwordHash: user.passwordHash || "",
+    avatar: user.avatar || "",
+    entries: user.entries || {},
+    stages: user.stages || []
+  };
+}
+
+function cloudStatePayload() {
+  return {
+    users: state.users.map(cloudUser)
+  };
+}
+
+function mergeCloudUsers(cloudUsers, localUsers) {
+  const merged = new Map();
+  [...localUsers, ...cloudUsers].forEach((user) => {
+    const key = user.account || user.id;
+    const previous = merged.get(key) || {};
+    merged.set(key, {
+      ...previous,
+      ...user,
+      password: user.password || previous.password || "",
+      passwordHash: user.passwordHash || previous.passwordHash || "",
+      entries: {
+        ...(previous.entries || {}),
+        ...(user.entries || {})
+      },
+      stages: [...(previous.stages || []), ...(user.stages || [])]
+        .filter((stage, index, list) => list.findIndex((item) => item.id === stage.id) === index)
+    });
+  });
+  return [...merged.values()];
+}
+
+function applyCloudState(cloudPayload) {
+  if (!cloudPayload || !Array.isArray(cloudPayload.users)) return;
+  const currentAccount = currentUser()?.account || "";
+  const viewingAccount = viewedUser()?.account || currentAccount;
+  const merged = mergeCloudUsers(cloudPayload.users, state.users);
+  state = normalizeState({
+    ...state,
+    users: merged
+  });
+  state.currentUserId = state.users.find((user) => user.account === currentAccount)?.id || state.currentUserId;
+  state.viewingUserId = state.users.find((user) => user.account === viewingAccount)?.id || state.currentUserId || state.users[0]?.id || "";
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+async function loadCloudState() {
+  const client = getCloudClient();
+  if (!client) return;
+  const { data, error } = await client.from(CLOUD_TABLE).select("state").eq("id", CLOUD_ROW_ID).maybeSingle();
+  if (error) {
+    console.warn("Cloud sync load failed", error);
+    return;
+  }
+  if (data?.state) {
+    isApplyingCloudState = true;
+    applyCloudState(data.state);
+    isApplyingCloudState = false;
+    render();
+  }
+}
+
+function scheduleCloudSave() {
+  if (isApplyingCloudState || !getCloudClient()) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(() => {
+    saveCloudState();
+  }, CLOUD_SAVE_DELAY);
+}
+
+async function saveCloudState() {
+  const client = getCloudClient();
+  if (!client) return;
+  const payload = {
+    id: CLOUD_ROW_ID,
+    state: cloudStatePayload(),
+    updated_at: new Date().toISOString()
+  };
+  const { error } = await client.from(CLOUD_TABLE).upsert(payload, { onConflict: "id" });
+  if (error) console.warn("Cloud sync save failed", error);
+}
+
+function subscribeCloudState() {
+  const client = getCloudClient();
+  if (!client) return;
+  client
+    .channel("fitlog-state")
+    .on("postgres_changes", { event: "*", schema: "public", table: CLOUD_TABLE }, (payload) => {
+      if (payload.new?.state) {
+        isApplyingCloudState = true;
+        applyCloudState(payload.new.state);
+        isApplyingCloudState = false;
+        render();
+      }
+    })
+    .subscribe();
 }
 
 function currentUser() {
@@ -1020,12 +1154,13 @@ function bindEvents() {
     button.addEventListener("click", () => switchAuthTab(button.dataset.authTab));
   });
 
-  el.loginForm.addEventListener("submit", (event) => {
+  el.loginForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const account = el.loginAccount.value.trim();
     const password = el.loginPassword.value;
-    const user = state.users.find((item) => item.account === account && item.password === password);
-    if (!user) {
+    const user = state.users.find((item) => item.account === account);
+    const isValidPassword = user ? await passwordMatches(user, password) : false;
+    if (!user || !isValidPassword) {
       el.loginMessage.textContent = "账号或密码不正确。";
       return;
     }
@@ -1053,7 +1188,8 @@ function bindEvents() {
       id: crypto.randomUUID(),
       name,
       account,
-      password,
+      password: "",
+      passwordHash: await hashPassword(password),
       avatar: await readPhoto(el.registerAvatar.files[0]),
       entries: {},
       stages: []
@@ -1224,3 +1360,6 @@ function bindEvents() {
 
 bindEvents();
 render();
+loadCloudState();
+subscribeCloudState();
+window.addEventListener("focus", loadCloudState);
